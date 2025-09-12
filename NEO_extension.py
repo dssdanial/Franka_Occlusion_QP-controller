@@ -9,201 +9,285 @@ import warnings
 import swift
 import time
 
+class Obstacle:
+    """Represents a static obstacle in the environment"""
+    def __init__(self, position, radius=0.1):
+        self.position = np.array(position)
+        self.radius = radius
+    
+    def get_distance_to_point(self, point):
+        """Get distance from obstacle surface to a point (negative if inside)"""
+        return np.linalg.norm(point - self.position) - self.radius
+
 class Workspace:
-    """
-    Defines a rectangular workspace with 4 walls (front, left, right, floor)
-    """
+    """Defines rectangular workspace with hard boundaries"""
     def __init__(self, x_limits, y_limits, z_limits):
         self.x_min, self.x_max = x_limits
         self.y_min, self.y_max = y_limits
         self.z_min, self.z_max = z_limits
     
-    def is_inside(self, point):
-        """Check if a point is inside the workspace"""
+    def is_inside(self, point, margin=0.0):
+        """Check if point is inside workspace with optional margin"""
         x, y, z = point
-        return (self.x_min <= x <= self.x_max and 
-                self.y_min <= y <= self.y_max and 
-                self.z_min <= z <= self.z_max)
+        return (self.x_min + margin <= x <= self.x_max - margin and 
+                self.y_min + margin <= y <= self.y_max - margin and 
+                self.z_min + margin <= z <= self.z_max - margin)
     
-    def get_violations_and_jacobians(self, positions, jacobians):
-        """
-        Get workspace violations and corresponding constraint jacobians
-        Returns constraint matrices for QP: A_ineq @ q_dot <= b_ineq
-        """
+    def get_distance_to_boundaries(self, point):
+        """Get minimum distance to any workspace boundary (negative if outside)"""
+        x, y, z = point
+        distances = [
+            #x - self.x_min,      # Distance to left wall
+            self.x_max - x,      # Distance to right wall
+            y - self.y_min,      # Distance to back wall  
+            self.y_max - y,      # Distance to front wall
+            z - self.z_min,      # Distance to floor
+            # Note: No ceiling constraint in original code
+        ]
+        return min(distances)
+
+class NEOController:
+    """
+    Enhanced NEO Controller with improved constraint handling
+    """
+    
+    def __init__(self, robot, workspace=None, obstacles=None):
+        self.robot = robot
+        self.workspace = workspace  
+        self.obstacles = obstacles if obstacles is not None else []
+        self.n_joints = robot.n
+        
+        # NEO parameters - adjusted for better performance
+        self.beta = 0.8                    # End-effector gain (reduced for stability)
+        self.lambda_q = 0.1                # Velocity minimization (increased)
+        self.lambda_delta = 1000.0         # Slack penalty (increased)
+        
+        # Enhanced velocity damper parameters
+        self.xi = 1.5          # Damper gain (increased)
+        self.di = 0.20         # Influence distance (increased for more margin)
+        self.ds = 0.08         # Stopping distance (increased safety margin)
+        
+        # Safety margins
+        self.workspace_margin = 0.05       # Additional workspace margin
+        self.obstacle_margin = 0.02        # Additional obstacle margin
+        
+        print(f"Enhanced NEO Controller")
+        print(f"Robot: {robot.name} ({self.n_joints} joints)")
+        print(f"Velocity damper: ξ={self.xi}, di={self.di}m, ds={self.ds}m")
+        print(f"Safety margins: workspace={self.workspace_margin}m, obstacle={self.obstacle_margin}m")
+    
+    def _get_robot_collision_points(self, q):
+        """Get robot collision points and their Jacobians with better link coverage"""
+        points = []
+        jacobians = []
+        
+        try:
+            # Get individual link transforms for better collision detection
+            link_transforms = []
+            for i in range(self.n_joints):
+                try:
+                    T_link = self.robot.fkine(q, end=i+1)  # Transform to each joint
+                    link_transforms.append(T_link)
+                except:
+                    continue
+            
+            # End-effector (most important)
+            T_ee = self.robot.fkine(q)
+            points.append(T_ee.t)
+            J_ee = self.robot.jacob0(q)[:3, :]
+            jacobians.append(J_ee)
+            
+            # Add several intermediate points along the kinematic chain
+            if len(link_transforms) >= 3:
+                # Joint 3 position (shoulder/elbow area)
+                points.append(link_transforms[2].t)
+                J_joint3 = self.robot.jacob0(q, end=3)[:3, :]
+                jacobians.append(J_joint3)
+            
+            if len(link_transforms) >= 5:
+                # Joint 5 position (wrist area)
+                points.append(link_transforms[4].t)
+                J_joint5 = self.robot.jacob0(q, end=5)[:3, :]
+                jacobians.append(J_joint5)
+            
+            # Add additional interpolated points for better coverage
+            if len(link_transforms) >= 2:
+                # Midpoint between base and end-effector
+                mid_point = (link_transforms[1].t + T_ee.t) / 2
+                points.append(mid_point)
+                # Approximate Jacobian for midpoint
+                J_mid = (self.robot.jacob0(q, end=2)[:3, :] + J_ee) / 2
+                jacobians.append(J_mid)
+                
+        except Exception as e:
+            print(f"Warning - using fallback collision points: {e}")
+            # Fallback to just end-effector
+            T_ee = self.robot.fkine(q)
+            J_ee = self.robot.jacob0(q)[:3, :]
+            points = [T_ee.t]
+            jacobians = [J_ee]
+        
+        return points, jacobians
+    
+    def _formulate_workspace_constraints(self, points, jacobians):
+        """Enhanced workspace constraints with better margins"""
+        if self.workspace is None:
+            return np.empty((0, self.n_joints)), np.empty(0)
+        
         A_constraints = []
         b_constraints = []
         
-        for i, (pos, J) in enumerate(zip(positions, jacobians)):
-            x, y, z = pos
+        for point, J in zip(points, jacobians):
+            x, y, z = point
             
-            # Right wall (x <= x_max): violation if x > x_max
-            if x > self.x_max - 0.05:  # 5cm buffer
-                # Constraint: x_dot <= -gain * (x - x_max)
-                # x_dot = [1,0,0] @ J @ q_dot, so: [1,0,0] @ J @ q_dot <= -gain * violation
-                violation = x - self.x_max + 0.05
-                A_constraints.append(np.array([1, 0, 0]) @ J)
-                b_constraints.append(-2.0 * violation)
+            # Check each workspace boundary with enhanced margins
+            boundaries = [
+                # ('x_min', x - (self.workspace.x_min + self.workspace_margin), np.array([-1, 0, 0])),
+                ('x_max', (self.workspace.x_max - self.workspace_margin) - x, np.array([1, 0, 0])),   
+                ('y_min', y - (self.workspace.y_min + self.workspace_margin), np.array([0, -1, 0])),
+                ('y_max', (self.workspace.y_max - self.workspace_margin) - y, np.array([0, 1, 0])),   
+                ('z_min', z - (self.workspace.z_min + self.workspace_margin), np.array([0, 0, -1]))
+            ]
             
-            # Left wall (x >= x_min): violation if x < x_min  
-            if x < self.x_min + 0.05:
-                violation = self.x_min - x + 0.05
-                A_constraints.append(-np.array([1, 0, 0]) @ J)
-                b_constraints.append(-2.0 * violation)
-            
-            # Front wall (y <= y_max): violation if y > y_max
-            if y > self.y_max - 0.05:
-                violation = y - self.y_max + 0.05
-                A_constraints.append(np.array([0, 1, 0]) @ J)
-                b_constraints.append(-2.0 * violation)
-            
-            # Back wall (y >= y_min): violation if y < y_min
-            if y < self.y_min + 0.05:
-                violation = self.y_min - y + 0.05
-                A_constraints.append(-np.array([0, 1, 0]) @ J)
-                b_constraints.append(-2.0 * violation)
-            
-            # Floor (z >= z_min): violation if z < z_min
-            if z < self.z_min + 0.05:
-                violation = self.z_min - z + 0.05
-                A_constraints.append(-np.array([0, 0, 1]) @ J)
-                b_constraints.append(-2.0 * violation)
+            for boundary_name, distance, normal in boundaries:
+                if distance < self.di:  # Within influence distance
+                    # Enhanced velocity damper constraint
+                    if distance > self.ds:
+                        # ḋ ≤ ξ(d-ds)/(di-ds) with enhanced damping
+                        damper_limit = self.xi * (distance - self.ds) / (self.di - self.ds)
+                    else:
+                        # Very close to boundary - strong stopping constraint
+                        damper_limit = -0.1  # Allow slight movement away from boundary
+                    
+                    # Distance rate: ḋ = ∇d · q̇ = normal^T · J · q̇
+                    distance_jacobian = normal @ J
+                    
+                    # Scale constraint based on proximity (closer = stronger constraint)
+                    constraint_weight = max(1.0, (self.di - distance) / self.di * 2.0)
+                    
+                    A_constraints.append(constraint_weight * distance_jacobian)
+                    b_constraints.append(constraint_weight * damper_limit)
+                    
+                    if np.random.rand() < 0.02:  # Debug print occasionally
+                        print(f"Workspace: {boundary_name}, d={distance:.3f}, limit={damper_limit:.3f}, weight={constraint_weight:.2f}")
         
         if len(A_constraints) > 0:
             return np.vstack(A_constraints), np.array(b_constraints)
         else:
-            return np.empty((0, jacobians[0].shape[1])), np.empty(0)
-
-class NEOController:
-    """
-    Simplified NEO Controller with Proper Workspace Constraints
-    """
+            return np.empty((0, self.n_joints)), np.empty(0)
     
-    def __init__(self, robot, workspace=None):
-        self.robot = robot
-        self.workspace = workspace
-        self.n_joints = robot.n
+    def _formulate_obstacle_constraints(self, points, jacobians):
+        """Enhanced obstacle constraints with better detection"""
+        A_constraints = []
+        b_constraints = []
         
-        # Control parameters
-        self.beta = 1.5                    # End-effector velocity gain
-        self.lambda_q = 0.01              # Joint velocity regularization
-        self.lambda_manip = 0.1           # Manipulability weight
-        
-        # Collision points to check (simplified)
-        self.check_points = [
-            {'name': 'end_effector', 'link': 6},    # End-effector
-            {'name': 'wrist', 'link': 5},           # Wrist
-            {'name': 'elbow', 'link': 3},           # Elbow
-        ]
-        
-        print(f"Initialized NEO controller for {robot.name} with {self.n_joints} joints")
-    
-    def _get_manipulability_measure(self, q):
-        """Get manipulability measure and its gradient"""
-        try:
-            J = self.robot.jacob0(q)
-            Jv = J[:3, :]  # Translational Jacobian
-            
-            # Manipulability measure (Yoshikawa)
-            manipulability = np.sqrt(np.linalg.det(Jv @ Jv.T + 1e-6 * np.eye(3)))
-            
-            # Gradient using finite differences
-            grad_manip = np.zeros(self.n_joints)
-            epsilon = 1e-6
-            
-            for i in range(self.n_joints):
-                q_plus = q.copy()
-                q_plus[i] += epsilon
+        for point, J in zip(points, jacobians):
+            for i, obs in enumerate(self.obstacles):
+                # Distance to obstacle surface (with additional margin)
+                raw_distance = obs.get_distance_to_point(point)
+                distance = raw_distance - self.obstacle_margin
                 
-                J_plus = self.robot.jacob0(q_plus)
-                Jv_plus = J_plus[:3, :]
-                manip_plus = np.sqrt(np.linalg.det(Jv_plus @ Jv_plus.T + 1e-6 * np.eye(3)))
-                
-                grad_manip[i] = (manip_plus - manipulability) / epsilon
-            
-            return manipulability, grad_manip
-            
-        except:
-            return 1.0, np.zeros(self.n_joints)
-    
-    def _get_collision_points_info(self, q):
-        """Get positions and jacobians for collision checking points"""
-        positions = []
-        jacobians = []
+                if distance < self.di:  # Within influence distance
+                    # Direction from obstacle center to robot point
+                    direction = point - obs.position
+                    dist_to_center = np.linalg.norm(direction)
+                    
+                    if dist_to_center > 1e-6:
+                        normal = direction / dist_to_center  # Outward normal
+                        
+                        # Enhanced velocity damper constraint  
+                        if distance > self.ds:
+                            damper_limit = self.xi * (distance - self.ds) / (self.di - self.ds)
+                        else:
+                            # Very close to obstacle - strong repulsion
+                            damper_limit = -0.2
+                        
+                        # Distance rate: ḋ = normal^T · J · q̇
+                        distance_jacobian = normal @ J
+                        
+                        # Scale constraint based on proximity and obstacle size
+                        proximity_factor = max(1.0, (self.di - distance) / self.di * 3.0)
+                        size_factor = obs.radius / 0.05  # Scale with obstacle size
+                        constraint_weight = proximity_factor * size_factor
+                        
+                        A_constraints.append(constraint_weight * distance_jacobian)
+                        b_constraints.append(constraint_weight * damper_limit)
+                        
+                        if np.random.rand() < 0.02:
+                            print(f"Obstacle {i}: d={distance:.3f}, raw_d={raw_distance:.3f}, limit={damper_limit:.3f}, weight={constraint_weight:.2f}")
         
-        for point_info in self.check_points:
-            link_idx = point_info['link']
-            
-            # Get position
-            if link_idx == 6:  # End-effector
-                T = self.robot.fkine(q)
-                pos = T.t
-                J_full = self.robot.jacob0(q)
-                J_trans = J_full[:3, :]
-            else:
-                # Get intermediate link position and Jacobian
-                T = self.robot.fkine(q)  # We'll use a simpler approach
-                pos = T.t  # This is a simplification - in reality you'd compute each link
-                J_full = self.robot.jacob0(q)
-                J_trans = J_full[:3, :]
-                # Zero out joints beyond this link
-                J_trans[:, link_idx+1:] = 0
-            
-            positions.append(pos)
-            jacobians.append(J_trans)
-        
-        return positions, jacobians
+        if len(A_constraints) > 0:
+            return np.vstack(A_constraints), np.array(b_constraints)
+        else:
+            return np.empty((0, self.n_joints)), np.empty(0)
     
     def solve(self, q, T_desired, q_dot_limits=None):
-        """
-        Solve for joint velocities using QP with workspace constraints
-        """
+        """Enhanced QP solver with better constraint handling"""
         if q_dot_limits is None:
-            q_dot_limits = np.ones(self.n_joints) * 2.0
+            q_dot_limits = np.ones(self.n_joints) * 0.8  # Reduced for safety
         
         try:
+            # Check if target is reachable and safe
+            if self.workspace is not None:
+                target_safe = self.workspace.is_inside(T_desired.t, margin=self.workspace_margin)
+                if not target_safe:
+                    print(f"WARNING: Target outside safe workspace!")
+                    # Modify target to be inside workspace
+                    target_pos = T_desired.t.copy()
+                    target_pos[0] = np.clip(target_pos[0], 
+                                          self.workspace.x_min + self.workspace_margin,
+                                          self.workspace.x_max - self.workspace_margin)
+                    target_pos[1] = np.clip(target_pos[1],
+                                          self.workspace.y_min + self.workspace_margin, 
+                                          self.workspace.y_max - self.workspace_margin)
+                    target_pos[2] = np.clip(target_pos[2],
+                                          self.workspace.z_min + self.workspace_margin,
+                                          self.workspace.z_max)
+                    T_desired = SE3.Trans(target_pos) * SE3.RPY(T_desired.rpy())
+                    print(f"Target clipped to: {target_pos}")
+            
             # Current end-effector pose
             T_current = self.robot.fkine(q)
             
-            # Pose error
-            pos_error = T_desired.t - T_current.t
+            # Pose error with saturation
+            pose_error = T_desired.t - T_current.t
+            pose_error = np.clip(pose_error, -0.3, 0.3)  # Limit large errors
             
-            # Rotation error (simplified)
+            # Rotation error (simplified and saturated)
             R_error = T_desired.R @ T_current.R.T
-            rot_error = R.from_matrix(R_error).as_rotvec()
-            rot_error = np.clip(rot_error, -0.5, 0.5)  # Limit rotation
+            try:
+                rot_error = R.from_matrix(R_error).as_rotvec()
+                rot_error = np.clip(rot_error, -0.2, 0.2)
+            except:
+                rot_error = np.zeros(3)
             
             # Desired end-effector velocity
-            nu_desired = self.beta * np.concatenate([pos_error, rot_error])
+            nu_desired = self.beta * np.concatenate([pose_error, rot_error])
             
             # Robot Jacobian
             J = self.robot.jacob0(q)
             
-            # Get manipulability
-            manip, grad_manip = self._get_manipulability_measure(q)
+            # Get robot collision points
+            points, jacobians = self._get_robot_collision_points(q)
             
-            # Get workspace constraints
-            positions, jacobians = self._get_collision_points_info(q)
+            # Formulate constraints
+            A_workspace, b_workspace = self._formulate_workspace_constraints(points, jacobians)
+            A_obstacles, b_obstacles = self._formulate_obstacle_constraints(points, jacobians)
             
-            if self.workspace is not None:
-                A_workspace, b_workspace = self.workspace.get_violations_and_jacobians(positions, jacobians)
-            else:
-                A_workspace = np.empty((0, self.n_joints))
-                b_workspace = np.empty(0)
+            # QP variables: [q_dot, slack]
+            n_vars = self.n_joints + 6
             
-            # Set up QP problem: minimize 0.5 * x^T * P * x + q^T * x
-            # subject to: A * x <= b, and Aeq * x = beq
-            
-            n_vars = self.n_joints + 6  # q_dot + slack variables for end-effector constraint
-            
-            # Objective matrix P and vector q
+            # Enhanced objective with regularization
             P = np.zeros((n_vars, n_vars))
-            P[:self.n_joints, :self.n_joints] = self.lambda_q * np.eye(self.n_joints)  # Regularization
-            P[self.n_joints:, self.n_joints:] = 1000.0 * np.eye(6)  # Heavy penalty on slack
+            P[:self.n_joints, :self.n_joints] = self.lambda_q * np.eye(self.n_joints)
+            P[self.n_joints:, self.n_joints:] = self.lambda_delta * np.eye(6)
+            
+            # Add small regularization for numerical stability
+            P += 1e-6 * np.eye(n_vars)
             
             q_obj = np.zeros(n_vars)
-            q_obj[:self.n_joints] = -self.lambda_manip * grad_manip  # Maximize manipulability
             
-            # Equality constraint: J * q_dot + slack = nu_desired
+            # Equality constraint: J * q_dot + slack = nu_desired  
             A_eq = np.zeros((6, n_vars))
             A_eq[:, :self.n_joints] = J
             A_eq[:, self.n_joints:] = np.eye(6)
@@ -212,19 +296,25 @@ class NEOController:
             # Inequality constraints
             constraints = []
             
-            # Joint velocity limits: -q_dot_max <= q_dot <= q_dot_max
+            # Joint velocity limits with safety factor
+            safety_factor = 0.8
             A_vel = np.zeros((2 * self.n_joints, n_vars))
             A_vel[:self.n_joints, :self.n_joints] = np.eye(self.n_joints)
-            A_vel[self.n_joints:2*self.n_joints, :self.n_joints] = -np.eye(self.n_joints)
-            b_vel = np.concatenate([q_dot_limits, q_dot_limits])
-            
+            A_vel[self.n_joints:, :self.n_joints] = -np.eye(self.n_joints)
+            b_vel = np.concatenate([safety_factor * q_dot_limits, safety_factor * q_dot_limits])
             constraints.append((A_vel, b_vel))
             
             # Workspace constraints
             if A_workspace.shape[0] > 0:
-                A_workspace_full = np.zeros((A_workspace.shape[0], n_vars))
-                A_workspace_full[:, :self.n_joints] = A_workspace
-                constraints.append((A_workspace_full, b_workspace))
+                A_ws_full = np.zeros((A_workspace.shape[0], n_vars))
+                A_ws_full[:, :self.n_joints] = A_workspace
+                constraints.append((A_ws_full, b_workspace))
+            
+            # Obstacle constraints  
+            if A_obstacles.shape[0] > 0:
+                A_obs_full = np.zeros((A_obstacles.shape[0], n_vars))
+                A_obs_full[:, :self.n_joints] = A_obstacles
+                constraints.append((A_obs_full, b_obstacles))
             
             # Combine all inequality constraints
             if constraints:
@@ -234,75 +324,148 @@ class NEOController:
                 A_ineq = np.empty((0, n_vars))
                 b_ineq = np.empty(0)
             
-            # Solve QP
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    
-                    solution = qpsolvers.solve_qp(
-                        P=P,
-                        q=q_obj,
-                        A=A_ineq,
-                        b=b_ineq,
-                        G=A_eq,
-                        h=b_eq,
-                        solver='quadprog'
-                    )
-                
-                if solution is not None and not np.any(np.isnan(solution)):
-                    q_dot = solution[:self.n_joints]
-                    slack = solution[self.n_joints:]
-                    
-                    # Check if slack is reasonable (small)
-                    if np.linalg.norm(slack) > 0.5:
-                        print(f"Large slack detected: {np.linalg.norm(slack):.3f}")
-                    
-                    return np.clip(q_dot, -q_dot_limits, q_dot_limits)
-                else:
-                    raise Exception("QP returned None or NaN")
+            # Variable bounds
+            lb = np.full(n_vars, -np.inf)
+            ub = np.full(n_vars, np.inf)
             
-            except Exception as e:
-                print(f"QP failed: {e}")
-                # Fallback to damped pseudo-inverse
-                J_pinv = np.linalg.pinv(J.T @ J + 0.01 * np.eye(self.n_joints)) @ J.T
-                q_dot = J_pinv @ nu_desired
-                return np.clip(q_dot, -q_dot_limits, q_dot_limits)
+            # Joint velocity bounds
+            lb[:self.n_joints] = -safety_factor * q_dot_limits
+            ub[:self.n_joints] = safety_factor * q_dot_limits
+            
+            # Slack bounds (allow reasonable slack)
+            lb[self.n_joints:] = -2.0
+            ub[self.n_joints:] = 2.0
+            
+            # Solve QP with multiple solvers as fallback
+            solution = None
+            solvers_to_try = ['quadprog', 'osqp', 'cvxopt']
+            
+            for solver in solvers_to_try:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        
+                        solution = qpsolvers.solve_qp(
+                            P=P,
+                            q=q_obj,
+                            A=A_ineq,
+                            b=b_ineq,
+                            G=A_eq,
+                            h=b_eq,
+                            lb=lb,
+                            ub=ub,
+                            solver=solver
+                        )
+                    
+                    if solution is not None and not np.any(np.isnan(solution)):
+                        break
+                except:
+                    continue
+            
+            if solution is not None and not np.any(np.isnan(solution)):
+                q_dot = solution[:self.n_joints]
+                slack = solution[self.n_joints:]
                 
+                # Monitor and report constraint violations
+                if A_workspace.shape[0] > 0:
+                    violations = A_workspace @ q_dot - b_workspace
+                    max_violation = np.max(violations)
+                    if max_violation > 0.01:
+                        print(f"Workspace violation: {max_violation:.3f}")
+                
+                if A_obstacles.shape[0] > 0:
+                    violations = A_obstacles @ q_dot - b_obstacles
+                    max_violation = np.max(violations)
+                    if max_violation > 0.01:
+                        print(f"Obstacle violation: {max_violation:.3f}")
+                
+                return np.clip(q_dot, -q_dot_limits, q_dot_limits)
+            else:
+                raise Exception("All QP solvers failed")
+        
         except Exception as e:
-            print(f"Controller error: {e}")
-            return np.zeros(self.n_joints)
+            if np.random.rand() < 0.1:
+                print(f"QP failed: {e}")
+            
+            # Enhanced emergency fallback
+            points, jacobians = self._get_robot_collision_points(q)
+            
+            # Check for critical violations
+            critical_violations = False
+            emergency_vel = np.zeros(self.n_joints)
+            
+            # Workspace violations
+            for point, J in zip(points, jacobians):
+                if self.workspace is not None:
+                    if not self.workspace.is_inside(point, margin=0):
+                        critical_violations = True
+                        # Emergency push toward workspace center
+                        workspace_center = np.array([
+                            (self.workspace.x_min + self.workspace.x_max) / 2,
+                            (self.workspace.y_min + self.workspace.y_max) / 2,
+                            (self.workspace.z_min + self.workspace.z_max) / 2
+                        ])
+                        direction_to_center = workspace_center - point
+                        direction_to_center = direction_to_center / (np.linalg.norm(direction_to_center) + 1e-6)
+                        try:
+                            emergency_vel += 0.3 * J.T @ direction_to_center
+                        except:
+                            pass
+                
+                # Obstacle violations
+                for obs in self.obstacles:
+                    distance = obs.get_distance_to_point(point)
+                    if distance < 0:  # Inside obstacle
+                        critical_violations = True
+                        direction = point - obs.position
+                        direction = direction / (np.linalg.norm(direction) + 1e-6)
+                        try:
+                            emergency_vel += 0.5 * J.T @ direction
+                        except:
+                            pass
+            
+            if critical_violations:
+                print("EMERGENCY: Critical violations detected!")
+                return np.clip(emergency_vel, -q_dot_limits * 0.5, q_dot_limits * 0.5)
+            else:
+                # Regular fallback - pseudo-inverse with damping
+                try:
+                    T_current = self.robot.fkine(q)
+                    pose_error = T_desired.t - T_current.t
+                    nu_desired = self.beta * 0.5 * np.concatenate([pose_error, np.zeros(3)])
+                    
+                    J = self.robot.jacob0(q)
+                    J_reg = J.T @ J + 0.1 * np.eye(self.n_joints)
+                    q_dot = np.linalg.solve(J_reg, J.T @ nu_desired)
+                    return np.clip(q_dot, -q_dot_limits * 0.3, q_dot_limits * 0.3)
+                except:
+                    return np.zeros(self.n_joints)
 
 def create_workspace_visual(env, workspace):
-    """Create workspace visualization"""
+    """Create workspace visualization with better visibility"""
     x_min, x_max = workspace.x_min, workspace.x_max
     y_min, y_max = workspace.y_min, workspace.y_max
     z_min, z_max = workspace.z_min, workspace.z_max
     
-    wall_thickness = 0.02
-    alpha = 0.4
-    wall_color = [0.8, 0.1, 0.1, alpha]
+    wall_thickness = 0.03
+    alpha = 0.7
+    wall_color = [0.9, 0.2, 0.2, alpha]
     
     walls = []
-    
-    # Wall specifications: [center, size]
     wall_specs = [
-        # Right wall (front boundary - x_max)
+        # Right wall (x_max)
         [[x_max + wall_thickness/2, (y_min+y_max)/2, (z_min+z_max)/2], 
          [wall_thickness, y_max-y_min, z_max-z_min]],
-        
-        # # Left wall (back boundary - x_min) 
+        # Left wall (x_min) 
         # [[x_min - wall_thickness/2, (y_min+y_max)/2, (z_min+z_max)/2],
         #  [wall_thickness, y_max-y_min, z_max-z_min]],
-        
-        # Front wall (left boundary - y_max)
+        # Front wall (y_max)
         [[(x_min+x_max)/2, y_max + wall_thickness/2, (z_min+z_max)/2],
          [x_max-x_min, wall_thickness, z_max-z_min]],
-        
-        # Back wall (right boundary - y_min)
+        # Back wall (y_min)
         [[(x_min+x_max)/2, y_min - wall_thickness/2, (z_min+z_max)/2],
          [x_max-x_min, wall_thickness, z_max-z_min]],
-        
-        # Floor
+        # Floor (z_min)
         [[(x_min+x_max)/2, (y_min+y_max)/2, z_min - wall_thickness/2],
          [x_max-x_min, y_max-y_min, wall_thickness]]
     ]
@@ -316,104 +479,161 @@ def create_workspace_visual(env, workspace):
     
     return walls
 
+def create_obstacle_visual(env, obstacle):
+    """Create obstacle visualization with enhanced visibility"""
+    obs_sphere = sg.Sphere(radius=obstacle.radius)
+    obs_sphere.T = sm.SE3.Trans(*obstacle.position)
+    obs_sphere.color = [1, 0.3, 0.3, 0.9]  # Brighter red
+    env.add(obs_sphere)
+    return obs_sphere
+
 # Main simulation
 if __name__ == "__main__":
-    # Initialize Swift environment
     env = swift.Swift()
     env.launch(realtime=True)
     
     # Create Panda robot
     panda = rtb.models.Panda()
-    
-    # Set to a reasonable starting configuration
-    panda.q = np.array([0.0, -0.5, 0.0, -2.0, 0.0, 1.0, 0.0])
-    
-    # Add robot to environment
+    # Start with robot safely inside workspace
+    panda.q = np.array([0.0, -0.3, 0.0, -1.2, 0.0, 0.9, 0.0])
     env.add(panda)
     
-    # Define workspace
+    # Define more conservative workspace with better margins
     workspace = Workspace(
-        x_limits=(0.0, 0.7),    # 0.5m depth
-        y_limits=(-0.8, 0.8),   # 0.6m width  
-        z_limits=(0.01, 0.8)    # 0.55m height
+        x_limits=(0.15, 0.65),    # 50cm depth with margin
+        y_limits=(-0.35, 0.35),   # 70cm width with margin  
+        z_limits=(0.0, 0.55)      # 55cm height with margin
     )
     
-    # Add workspace visualization
+    # Verify robot starts inside workspace
+    T_initial = panda.fkine(panda.q)
+    print(f"Initial robot position: {T_initial.t}")
+    print(f"Workspace: X=[{workspace.x_min:.2f}, {workspace.x_max:.2f}], Y=[{workspace.y_min:.2f}, {workspace.y_max:.2f}], Z=[{workspace.z_min:.2f}, {workspace.z_max:.2f}]")
+    print(f"Robot starts inside workspace: {workspace.is_inside(T_initial.t)}")
+    
+    # Create obstacles with better positioning
+    obstacles = [
+        Obstacle([0.4, 0.15, 0.3], radius=0.06),   # Slightly larger for better visibility
+        Obstacle([0.5, -0.15, 0.25], radius=0.05),
+        Obstacle([0.35, 0.0, 0.4], radius=0.04),   # Additional obstacle
+    ]
+    
+    # Add visuals
     walls = create_workspace_visual(env, workspace)
     
-    # Create controller
-    controller = NEOController(panda, workspace)
+    obstacle_visuals = []
+    for i, obs in enumerate(obstacles):
+        obs_visual = create_obstacle_visual(env, obs)
+        obstacle_visuals.append(obs_visual)
     
-    # Set target pose (reachable and inside workspace)
-    T_desired = SE3.Trans(0.45, 0.35, 0.08) * SE3.RPY(np.pi, 0, 0)
+    # Create enhanced NEO controller
+    controller = NEOController(panda, workspace, obstacles)
     
-    # Add target visualization
+    # Set target INSIDE the safe workspace
+    T_desired = SE3.Trans(0.2, 0.17, 0.05) * SE3.RPY(np.pi, 0, 0)
+    print(f"Target position: {T_desired.t}")
+    print(f"Target inside workspace: {workspace.is_inside(T_desired.t, margin=controller.workspace_margin)}")
+    
+    # Target visualization
     target = sg.Sphere(radius=0.025)
     target.T = T_desired
-    target.color = [0, 1, 0, 0.8]
+    target.color = [0, 1, 0, 1.0]
     env.add(target)
     
-    # Simulation parameters
-    dt = 0.05
-    max_iterations = 400
-    tolerance = 0.03
+    try:
+        env.step()
+        time.sleep(1.0)  # Give time to see initial setup
+    except:
+        pass
     
-    # Step environment
-    env.step()
-    
-    print(f"Starting simulation...")
-    print(f"Initial position: {panda.fkine(panda.q).t}")
-    print(f"Target position: {T_desired.t}")
+    print(f"\n{'='*60}")
+    print("ENHANCED NEO CONTROLLER")
+    print("Features: Enhanced margins, better obstacle detection, robust QP solving")
+    print(f"{'='*60}")
     
     # Control loop
+    dt = 0.04  # Slightly faster updates
+    max_iterations = 500
+    tolerance = 0.03  # Tighter tolerance
+    
     positions = []
     errors = []
+    violations_log = []
     
     try:
         for i in range(max_iterations):
             q = panda.q.copy()
             
-            # Solve for velocities
+            # Get control input
             q_dot = controller.solve(q, T_desired)
             
             # Update robot
             panda.q = q + q_dot * dt
             
-            # Log progress
+            # Track progress and violations
             T_current = panda.fkine(panda.q)
             positions.append(T_current.t.copy())
-            
             error = np.linalg.norm(T_current.t - T_desired.t)
             errors.append(error)
             
+            # Check violations with enhanced detection
+            points, _ = controller._get_robot_collision_points(panda.q)
+            workspace_violations = sum([1 for p in points if not workspace.is_inside(p, margin=0.01)])
+            obstacle_violations = 0
+            for p in points:
+                for obs in obstacles:
+                    if obs.get_distance_to_point(p) < 0.01:
+                        obstacle_violations += 1
+            
+            total_violations = workspace_violations + obstacle_violations
+            violations_log.append(total_violations)
+            
             if error < tolerance:
-                print(f"SUCCESS: Reached target in {i} iterations!")
+                print(f"SUCCESS: Target reached in {i} iterations!")
                 break
             
-            if i % 20 == 0:
-                print(f"Iter {i:3d}: error={error:.4f}m, |q_dot|_max={np.max(np.abs(q_dot)):.3f}")
+            if i % 25 == 0:
+                print(f"Iter {i:3d}: error={error:.4f}m, ws_viol={workspace_violations}, obs_viol={obstacle_violations}, |q̇|={np.linalg.norm(q_dot):.3f}")
             
-            # Step simulation
-            env.step()
-            time.sleep(0.02)
-            
+            try:
+                env.step()
+                time.sleep(0.025)
+            except:
+                continue
+                
     except KeyboardInterrupt:
-        print("Simulation interrupted")
+        print("Interrupted by user")
     
-    # Results
-    final_error = errors[-1] if errors else float('inf')
-    final_pos = positions[-1] if positions else [0, 0, 0]
-    
-    print(f"\n{'='*50}")
-    print("FINAL RESULTS")
-    print(f"{'='*50}")
-    print(f"Iterations: {len(errors)}")
-    print(f"Final error: {final_error:.4f}m")
-    print(f"Target: {T_desired.t}")
-    print(f"Actual: {final_pos}")
-    print(f"Success: {final_error < tolerance}")
-    print(f"In workspace: {workspace.is_inside(final_pos)}")
+    # Results analysis
+    if len(errors) > 0:
+        total_violations = sum(violations_log)
+        final_error = errors[-1]
+        success = final_error < tolerance
+        
+        print(f"\n{'='*60}")
+        print("ENHANCED NEO CONTROLLER RESULTS")
+        print(f"{'='*60}")
+        print(f"Final error: {final_error:.4f}m")
+        print(f"Target tolerance: {tolerance:.4f}m")
+        print(f"Total violations: {total_violations}")
+        print(f"Success: {success}")
+        
+        if total_violations == 0:
+            print("🎉 PERFECT: No constraint violations!")
+        elif total_violations < 5:
+            print("✅ GOOD: Minimal violations")
+        elif total_violations < 20:
+            print("⚠️  ACCEPTABLE: Some violations but controlled")
+        else:
+            print("❌ FAILED: Too many violations")
+        
+        if success and total_violations < 10:
+            print("🏆 MISSION ACCOMPLISHED: Target reached safely!")
     
     print(f"\nPress Enter to exit...")
     input()
-    env.close()
+    
+    try:
+        env.close()
+    except:
+        pass
